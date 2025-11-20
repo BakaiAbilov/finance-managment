@@ -1,3 +1,5 @@
+//server/server.js
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -8,7 +10,7 @@ const mysql = require('mysql2/promise');
 const app = express();
 app.use(express.json());
 app.use(
-  cors({
+  cors({  
     origin: ['http://localhost:5173', 'http://127.0.0.1:5173'],
   })
 );
@@ -39,8 +41,21 @@ const pool = mysql.createPool({
 
 // ---- utils ----
 function toMysqlDatetime(d = new Date()) {
-  return new Date(d).toISOString().slice(0, 19).replace('T', ' ');
+  const dt = new Date(d);
+
+  const pad = (n) => String(n).padStart(2, '0');
+
+  const year   = dt.getFullYear();
+  const month  = pad(dt.getMonth() + 1); // 0-11 -> 1-12
+  const day    = pad(dt.getDate());
+  const hour   = pad(dt.getHours());
+  const minute = pad(dt.getMinutes());
+  const second = pad(dt.getSeconds());
+
+  // ЛОКАЛЬНОЕ время, без UTC-сдвига
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
 }
+
 
 function monthRange(d = new Date()) {
   const start = new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0);
@@ -368,6 +383,40 @@ app.get('/api/cards/:cardUid/transactions', authMiddleware, async (req, res) => 
     res.status(500).json({ message: msg });
   }
 });
+// Краткая сводка по балансам: карты, наличные, всего
+app.get('/api/balance-summary', authMiddleware, async (req, res) => {
+  try {
+    // Всё, что привязано к картам
+    const [[cardsRow]] = await pool.query(
+      `SELECT IFNULL(SUM(amount), 0) AS totalCards
+         FROM transactions
+        WHERE user_id = ? AND card_id IS NOT NULL`,
+      [req.user.id]
+    );
+
+    // Всё, что считается "наличными" (операции без card_id)
+    const [[cashRow]] = await pool.query(
+      `SELECT IFNULL(SUM(amount), 0) AS totalCash
+         FROM transactions
+        WHERE user_id = ? AND card_id IS NULL`,
+      [req.user.id]
+    );
+
+    const cards = Number(cardsRow.totalCards || 0);
+    const cash  = Number(cashRow.totalCash || 0);
+    const total = cards + cash;
+
+    res.json({
+      cards,
+      cash,
+      total,
+    });
+  } catch (err) {
+    console.error('GET /api/balance-summary error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 
 
 // СОЗДАТЬ транзакцию (проверка баланса для расходов, автодата)
@@ -405,26 +454,21 @@ app.post('/api/transactions', authMiddleware, async (req, res) => {
     await conn.beginTransaction();
 
     // ===========================
-    // 🔹 Проверка бюджета (лимит по категории)
+    // 🔹 Проверка бюджета
     // ===========================
     if (t === 'EXPENSE' && category) {
-      // рассчитываем границы месяца (с 1 по 1 след.)
       const now = new Date();
       const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
       const startNextMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
       const fmt = (dt) => dt.toISOString().slice(0, 19).replace('T', ' ');
 
-      // ищем бюджет на эту категорию
       const [[budget]] = await conn.execute(
-        `SELECT id, limit_amount
-           FROM budgets
-          WHERE user_id = ? AND category = ? AND period = 'MONTH'
-          LIMIT 1`,
+        `SELECT id, limit_amount FROM budgets
+         WHERE user_id = ? AND category = ? AND period = 'MONTH' LIMIT 1`,
         [req.user.id, category]
       );
 
       if (budget) {
-        // считаем текущие расходы за месяц по этой категории
         const [[rowSpent]] = await conn.execute(
           `SELECT IFNULL(SUM(ABS(amount)), 0) AS spent
              FROM transactions
@@ -464,6 +508,24 @@ app.post('/api/transactions', authMiddleware, async (req, res) => {
     }
 
     // ===========================
+    // 🔹 Проверка баланса НАЛИЧНЫХ
+    // ===========================
+    if (!cardId && t === 'EXPENSE') {
+      const [[row]] = await conn.execute(
+        `SELECT IFNULL(SUM(amount),0) AS balance
+         FROM transactions
+         WHERE user_id = ? AND card_id IS NULL FOR UPDATE`,
+        [req.user.id]
+      );
+      const currCash = Number(row?.balance || 0);
+
+      if (Math.abs(signedAmount) > currCash) {
+        await conn.rollback();
+        return res.status(400).json({ message: 'Недостаточно наличных' });
+      }
+    }
+
+    // ===========================
     // 🔹 Добавляем транзакцию
     // ===========================
     const when = occurred_at ? toMysqlDatetime(new Date(occurred_at)) : null;
@@ -488,6 +550,7 @@ app.post('/api/transactions', authMiddleware, async (req, res) => {
 });
 
 
+
 // УДАЛИТЬ транзакцию
 app.delete('/api/transactions/:id', authMiddleware, async (req, res) => {
   try {
@@ -508,26 +571,71 @@ app.delete('/api/transactions/:id', authMiddleware, async (req, res) => {
   }
 });
 
+
 // последние операции пользователя (все карты) — новые сверху
 app.get('/api/transactions', authMiddleware, async (req, res) => {
   try {
     const limit = Math.min(100, Number(req.query.limit) || 20);
-    const [rows] = await pool.query(
-      `SELECT t.id, t.amount, t.type, t.category, t.description, t.occurred_at, t.is_mock,
-              c.card_uid, c.mask
-       FROM transactions t
-       LEFT JOIN cards c ON c.id = t.card_id
-       WHERE t.user_id = ?
-       ORDER BY t.occurred_at DESC, t.id DESC
-       LIMIT ?`,
-      [req.user.id, limit]
-    );
+
+    const { type, category, from, to } = req.query;
+
+    const where = ['t.user_id = ?'];
+    const params = [req.user.id];
+
+    // фильтр по типу
+    if (type === 'INCOME' || type === 'EXPENSE') {
+      where.push('t.type = ?');
+      params.push(type);
+    }
+
+    // фильтр по категории
+    if (category) {
+      where.push('t.category = ?');
+      params.push(category);
+    }
+
+    // фильтр по дате "с"
+    if (from) {
+      where.push('t.occurred_at >= ?');
+      params.push(from + ' 00:00:00');
+    }
+
+    // фильтр по дате "по"
+    if (to) {
+      where.push('t.occurred_at <= ?');
+      params.push(to + ' 23:59:59');
+    }
+
+    // лимит в конце
+    params.push(limit);
+
+    const sql = `
+      SELECT 
+        t.id,
+        t.amount,
+        t.type,
+        t.category,
+        t.description,
+        t.occurred_at,
+        t.is_mock,
+        c.card_uid,
+        c.mask
+      FROM transactions t
+      LEFT JOIN cards c ON c.id = t.card_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY t.occurred_at DESC, t.id DESC
+      LIMIT ?
+    `;
+
+    const [rows] = await pool.query(sql, params);
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    console.error('GET /api/transactions error:', err);
     res.status(500).json({ message: 'Server error' });
   }
 });
+
+
 // ==================== BUDGETS ====================
 
 // Список бюджетов + фактически потрачено за текущий месяц по категориям
@@ -723,78 +831,169 @@ app.patch('/api/goals/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Удалить цель + все её взносы
+// Удалить цель + откатить связанные транзакции (вернуть деньги)
 app.delete('/api/goals/:id', authMiddleware, async (req, res) => {
   const conn = await pool.getConnection();
+
   try {
     const id = Number(req.params.id);
-    if (!Number.isFinite(id)) { conn.release(); return res.status(400).json({ message: 'Bad id' }); }
+    if (!Number.isFinite(id)) {
+      conn.release();
+      return res.status(400).json({ message: 'Bad id' });
+    }
 
     await conn.beginTransaction();
-    await conn.execute(`DELETE FROM goal_contributions WHERE user_id = ? AND goal_id = ?`, [req.user.id, id]);
-    const [r] = await conn.execute(`DELETE FROM goals WHERE user_id = ? AND id = ?`, [req.user.id, id]);
+
+    // 1) забираем все tx_id связанных вкладов
+    const [gcRows] = await conn.execute(
+      `SELECT tx_id
+         FROM goal_contributions
+        WHERE user_id = ? AND goal_id = ? AND tx_id IS NOT NULL`,
+      [req.user.id, id]
+    );
+    const txIds = gcRows.map(r => r.tx_id).filter(Boolean);
+
+    // 2) удаляем сами вклады
+    await conn.execute(
+      `DELETE FROM goal_contributions WHERE user_id = ? AND goal_id = ?`,
+      [req.user.id, id]
+    );
+
+    // 3) удаляем транзакции, которыми деньги уходили в цель
+    if (txIds.length > 0) {
+      const placeholders = txIds.map(() => '?').join(',');
+      await conn.execute(
+        `DELETE FROM transactions
+          WHERE user_id = ? AND id IN (${placeholders})`,
+        [req.user.id, ...txIds]
+      );
+    }
+
+    // 4) удаляем цель
+    const [r] = await conn.execute(
+      `DELETE FROM goals WHERE user_id = ? AND id = ?`,
+      [req.user.id, id]
+    );
+
     await conn.commit();
     conn.release();
-    if (r.affectedRows === 0) return res.status(404).json({ message: 'Цель не найдена' });
+
+    if (r.affectedRows === 0) {
+      return res.status(404).json({ message: 'Цель не найдена' });
+    }
+
     res.json({ ok: true });
   } catch (err) {
-    await conn.rollback(); conn.release();
+    await conn.rollback();
+    conn.release();
     console.error('DELETE /api/goals/:id error:', err);
     res.status(500).json({ message: err.sqlMessage || 'Server error' });
   }
 });
 
-// Внести вклад в цель (с опцией создать транзакцию)
 app.post('/api/goals/:id/contribute', authMiddleware, async (req, res) => {
   const conn = await pool.getConnection();
   try {
     const id = Number(req.params.id);
     const { amount, create_tx = true, card_uid = null, description = 'Вклад в цель' } = req.body || {};
     const amt = Number(amount);
-    if (!Number.isFinite(amt) || amt <= 0) { conn.release(); return res.status(400).json({ message: 'Некорректная сумма' }); }
+    if (!Number.isFinite(amt) || amt <= 0) {
+      conn.release();
+      return res.status(400).json({ message: 'Некорректная сумма' });
+    }
 
-    // проверим, что цель существует
-    const [[goal]] = await conn.execute(`SELECT id FROM goals WHERE user_id = ? AND id = ?`, [req.user.id, id]);
-    if (!goal) { conn.release(); return res.status(404).json({ message: 'Цель не найдена' }); }
+    const [[goal]] = await conn.execute(
+      `SELECT id FROM goals WHERE user_id = ? AND id = ?`,
+      [req.user.id, id]
+    );
+    if (!goal) {
+      conn.release();
+      return res.status(404).json({ message: 'Цель не найдена' });
+    }
 
     await conn.beginTransaction();
 
-    // при необходимости найдём card_id
+    // найти карту
     let cardId = null;
     if (create_tx && card_uid) {
-      const [[card]] = await conn.execute(`SELECT id FROM cards WHERE user_id = ? AND card_uid = ?`, [req.user.id, card_uid]);
-      if (!card) { await conn.rollback(); conn.release(); return res.status(404).json({ message: 'Карта не найдена' }); }
+      const [[card]] = await conn.execute(
+        `SELECT id FROM cards WHERE user_id = ? AND card_uid = ?`,
+        [req.user.id, card_uid]
+      );
+      if (!card) {
+        await conn.rollback();
+        conn.release();
+        return res.status(404).json({ message: 'Карта не найдена' });
+      }
       cardId = card.id;
     }
 
-    // создадим транзакцию «перевод в накопления» (расход)
+    // ===========================
+    // 🔹 Проверка наличных/карты
+    // ===========================
+    if (create_tx) {
+      const need = Math.abs(amt);
+
+      if (cardId) {
+        const [[row]] = await conn.execute(
+          `SELECT IFNULL(SUM(amount),0) AS balance
+           FROM transactions
+           WHERE user_id = ? AND card_id = ? FOR UPDATE`,
+          [req.user.id, cardId]
+        );
+        const bal = Number(row?.balance || 0);
+        if (need > bal) {
+          await conn.rollback();
+          conn.release();
+          return res.status(400).json({ message: 'Недостаточно средств на карте для вклада' });
+        }
+      } else {
+        const [[row]] = await conn.execute(
+          `SELECT IFNULL(SUM(amount),0) AS balance
+           FROM transactions
+           WHERE user_id = ? AND card_id IS NULL FOR UPDATE`,
+          [req.user.id]
+        );
+        const bal = Number(row?.balance || 0);
+        if (need > bal) {
+          await conn.rollback();
+          conn.release();
+          return res.status(400).json({ message: 'Недостаточно наличных для вклада' });
+        }
+      }
+    }
+
+    // создать транзакцию (расход)
     let txId = null;
     if (create_tx) {
       const when = toMysqlDatetime(new Date());
       const [r] = await conn.execute(
         `INSERT INTO transactions
-         (user_id, card_id, amount, type, category, description, occurred_at, is_mock)
+           (user_id, card_id, amount, type, category, description, occurred_at, is_mock)
          VALUES (?, ?, ?, 'EXPENSE', ?, ?, ?, 1)`,
         [req.user.id, cardId, -Math.abs(amt), 'Накопления', description, when]
       );
       txId = r.insertId;
     }
 
-    // зафиксируем вклад
+    // внести вклад
     await conn.execute(
       `INSERT INTO goal_contributions (user_id, goal_id, amount, occurred_at, tx_id)
        VALUES (?, ?, ?, ?, ?)`,
       [req.user.id, id, amt, toMysqlDatetime(new Date()), txId]
     );
 
-    await conn.commit(); conn.release();
+    await conn.commit();
+    conn.release();
     res.status(201).json({ ok: true });
   } catch (err) {
-    await conn.rollback(); conn.release();
+    await conn.rollback();
+    conn.release();
     console.error('POST /api/goals/:id/contribute error:', err);
     res.status(500).json({ message: err.sqlMessage || 'Server error' });
   }
 });
+
 
 // Удалить вклад (при желании можно дополнить каскадным удалением связанной транзакции)
 app.delete('/api/goals/:id/contributions/:cid', authMiddleware, async (req, res) => {
@@ -872,7 +1071,6 @@ app.delete('/api/tx-templates/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Создать транзакцию по шаблону (с возможностью переопределить amount/card_uid/description)
 app.post('/api/tx-templates/:id/use', authMiddleware, async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -890,17 +1088,50 @@ app.post('/api/tx-templates/:id/use', authMiddleware, async (req, res) => {
     const description = req.body.description ?? tpl.description;
     const card_uid = req.body.card_uid ?? tpl.card_uid;
 
-    if (type !== 'INCOME' && type !== 'EXPENSE') return res.status(400).json({ message: 'type: INCOME | EXPENSE' });
-    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ message: 'Некорректная сумма' });
+    if (type !== 'INCOME' && type !== 'EXPENSE')
+      return res.status(400).json({ message: 'type: INCOME | EXPENSE' });
+    if (!Number.isFinite(amount) || amount <= 0)
+      return res.status(400).json({ message: 'Некорректная сумма' });
 
     let cardId = null;
     if (card_uid) {
-      const [[card]] = await pool.execute(`SELECT id FROM cards WHERE user_id = ? AND card_uid = ?`, [req.user.id, card_uid]);
+      const [[card]] = await pool.execute(
+        `SELECT id FROM cards WHERE user_id = ? AND card_uid = ?`,
+        [req.user.id, card_uid]
+      );
       if (!card) return res.status(404).json({ message: 'Карта не найдена' });
       cardId = card.id;
     }
 
     const signed = type === 'EXPENSE' ? -Math.abs(amount) : Math.abs(amount);
+
+    // ===========================
+    // 🔹 Проверка баланса
+    // ===========================
+    if (type === 'EXPENSE') {
+      if (cardId) {
+        const [[row]] = await pool.execute(
+          `SELECT IFNULL(SUM(amount),0) AS balance
+           FROM transactions WHERE user_id = ? AND card_id = ?`,
+          [req.user.id, cardId]
+        );
+        const bal = Number(row?.balance || 0);
+        if (Math.abs(signed) > bal) {
+          return res.status(400).json({ message: 'Недостаточно средств на карте' });
+        }
+      } else {
+        const [[row]] = await pool.execute(
+          `SELECT IFNULL(SUM(amount),0) AS balance
+           FROM transactions WHERE user_id = ? AND card_id IS NULL`,
+          [req.user.id]
+        );
+        const bal = Number(row?.balance || 0);
+        if (Math.abs(signed) > bal) {
+          return res.status(400).json({ message: 'Недостаточно наличных' });
+        }
+      }
+    }
+
     const when = toMysqlDatetime(new Date());
 
     const [r] = await pool.execute(
@@ -915,9 +1146,6 @@ app.post('/api/tx-templates/:id/use', authMiddleware, async (req, res) => {
   }
 });
 
-function toMysqlDatetime(d = new Date()) {
-  return new Date(d).toISOString().slice(0, 19).replace('T',' ');
-}
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server started on ${PORT}`));

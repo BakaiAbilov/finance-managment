@@ -1,3 +1,4 @@
+//src/pages/Transactions.jsx
 import { useEffect, useMemo, useState } from "react";
 import api from "../api";
 
@@ -13,6 +14,12 @@ export default function Transactions() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
   const [limit, setLimit] = useState(20);
+  const [filters, setFilters] = useState({
+    type: "",
+    category: "",
+    from: "",
+    to: ""
+  });
 
   const [form, setForm] = useState({
     type: "EXPENSE",
@@ -40,22 +47,33 @@ export default function Transactions() {
   };
 
   async function loadCardsAndTx() {
-    setLoading(true);
-    setError(null);
-    try {
-      const [cardsRes, txRes] = await Promise.all([
-        api.get("/cards"),
-        api.get("/transactions", { params: { limit } }),
-      ]);
-      setCards(cardsRes.data || []);
-      setTx(txRes.data || []);
-    } catch (e) {
-      console.error(e);
-      setError(e.response?.data?.message || e.message || "Ошибка загрузки");
-    } finally {
-      setLoading(false);
-    }
+  setLoading(true);
+  setError(null);
+
+  try {
+    const [cardsRes, txRes] = await Promise.all([
+      api.get("/cards"),
+      api.get("/transactions", {
+        params: {
+          limit,
+          type: filters.type || undefined,
+          category: filters.category || undefined,
+          from: filters.from || undefined,
+          to: filters.to || undefined,
+        }
+      })
+    ]);
+
+    setCards(cardsRes.data || []);
+    setTx(txRes.data || []);
+  } catch (e) {
+    console.error(e);
+    setError(e.response?.data?.message || "Ошибка загрузки");
+  } finally {
+    setLoading(false);
   }
+  }
+
 
   useEffect(() => {
     loadCardsAndTx();
@@ -78,15 +96,16 @@ export default function Transactions() {
     try {
       await api.post("/transactions", {
         card_uid: form.card_uid || null,
-        amount: amountNum,                 // число без знака
-        type: form.type,                   // 'INCOME' | 'EXPENSE'
+        amount: amountNum,
+        type: form.type,
         category: form.category || null,
         description: form.description || null,
         occurred_at:
           form.manualDate && form.occurred_at
-            ? new Date(form.occurred_at).toISOString()
-            : null,                        // сервер поставит NOW(3)
+            ? form.occurred_at
+            : null,
       });
+
 
       await loadCardsAndTx();
 
@@ -210,6 +229,54 @@ export default function Transactions() {
           {[10,20,50,100].map(n => <option key={n} value={n}>{n}</option>)}
         </select>
       </div>
+      {/* Фильтры по истории */}
+      <div className="flex gap-3 flex-wrap mt-2">
+        <select
+          className="border p-2 rounded-xl"
+          value={filters.type}
+          onChange={(e) => setFilters({ ...filters, type: e.target.value })}
+        >
+          <option value="">Тип: все</option>
+          <option value="INCOME">Доход</option>
+          <option value="EXPENSE">Расход</option>
+        </select>
+
+        <select
+          className="border p-2 rounded-xl"
+          value={filters.category}
+          onChange={(e) => setFilters({ ...filters, category: e.target.value })}
+        >
+          <option value="">Категория: все</option>
+          {CATEGORIES.EXPENSE.concat(CATEGORIES.INCOME).map((c) => (
+            <option key={c} value={c}>
+              {c}
+            </option>
+          ))}
+        </select>
+
+        <input
+          type="date"
+          className="border p-2 rounded-xl"
+          value={filters.from}
+          onChange={(e) => setFilters({ ...filters, from: e.target.value })}
+        />
+
+        <input
+          type="date"
+          className="border p-2 rounded-xl"
+          value={filters.to}
+          onChange={(e) => setFilters({ ...filters, to: e.target.value })}
+        />
+
+        <button
+          type="button"
+          onClick={loadCardsAndTx}
+          className="px-4 py-2 bg-indigo-600 text-white rounded-xl"
+        >
+          Применить
+        </button>
+      </div>
+
 
       {/* Список транзакций */}
       <div className="bg-white rounded-2xl shadow divide-y">

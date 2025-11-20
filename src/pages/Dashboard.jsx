@@ -191,18 +191,28 @@ export default function Dashboard() {
   const [budgets, setBudgets] = useState([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState(null);
+  const [balanceSummary, setBalanceSummary] = useState({
+    cards: 0,
+    cash: 0,
+    total: 0,
+  });
 
   useEffect(() => {
   (async () => {
     setLoading(true);
     setErr(null);
     try {
-      const [{ data: txData }, { data: budData }] = await Promise.all([
-        api.get("/transactions", { params: { limit: 500 } }),
-        api.get("/budgets"),                       // тянем бюджеты из БД
-      ]);
+      const [{ data: txData }, { data: budData }, { data: balData }] =
+       await Promise.all([
+         api.get("/transactions", { params: { limit: 500 } }),
+         api.get("/budgets"),
+         api.get("/balance-summary"),
+        ]);
       setTx(Array.isArray(txData) ? txData : []);
       setBudgets(Array.isArray(budData) ? budData : []);
+      setBalanceSummary(
+       balData || { cards: 0, cash: 0, total: 0 }
+     );
     } catch (e) {
       console.error("load failed", e);
       setErr(e.response?.data?.message || e.message || "Ошибка загрузки");
@@ -287,10 +297,16 @@ export default function Dashboard() {
         </div>
       </div>
       <div className="bg-white rounded-2xl border p-4">
-        <div className="text-sm text-gray-500">Остаток</div>
+        <div className="text-sm text-gray-500">Доступно сейчас</div>
         <div className="text-2xl font-semibold mt-1">
-          {loading ? "…" : fmtMoney(saving)}
+          {loading ? "…" : fmtMoney(balanceSummary.total)}
         </div>
+        {!loading && (
+        <div className="text-xs text-gray-500 mt-1">
+          Карты: {balanceSummary.cards.toLocaleString("ru-RU")} · Наличные:{" "}
+        {balanceSummary.cash.toLocaleString("ru-RU")}
+        </div>
+        )}
       </div>
     </div>
 
